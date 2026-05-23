@@ -35,6 +35,7 @@ option(USEARCH_BUILD_TEST_C "Compile a test for the C 99 interface" OFF)
 option(USEARCH_BUILD_JNI "Compile JNI library for Java bindings" OFF)
 option(USEARCH_BUILD_WOLFRAM "Compile Wolfram Language bindings" OFF)
 option(USEARCH_BUILD_SQLITE "Compile separate SQLite extension" OFF)
+option(USEARCH_BUILD_REGRESSIONS "Compile fuzz/regressions/* tests" OFF)
 
 # Includes
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake ${CMAKE_MODULE_PATH})
@@ -423,4 +424,8 @@ endif ()
 
 if (${USEARCH_BUILD_SQLITE})
     add_subdirectory(sqlite)
+endif ()
+
+if (${USEARCH_BUILD_REGRESSIONS})
+    add_subdirectory(fuzz/regressions)
 endif ()

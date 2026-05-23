@@ -3781,6 +3781,15 @@ class index_gt {
 
         pre_ = precompute_(config_);
         misaligned_ptr_gt<level_t> levels{(byte_t*)file.data() + offset + sizeof(header)};
+        // Reject negative levels up-front: the graph never produces them and
+        // `node_neighbors_bytes_` happily promotes them to huge unsigned
+        // values, distorting every subsequent offset calculation.
+        for (std::size_t i = 0; i < header.size; ++i) {
+            if (levels[i] < 0) {
+                reset();
+                return result.failed("Negative node level in viewed file");
+            }
+        }
         offsets[0u] = offset + sizeof(header) + sizeof(level_t) * header.size;
         for (std::size_t i = 1; i < header.size; ++i)
             offsets[i] = offsets[i - 1] + node_bytes_(levels[i - 1]);
