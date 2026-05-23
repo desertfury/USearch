@@ -262,7 +262,11 @@ USEARCH_EXPORT void usearch_save_buffer(usearch_index_t index, void* buffer, siz
 USEARCH_EXPORT void usearch_load_buffer(usearch_index_t index, void const* buffer, size_t length,
                                         usearch_error_t* error) {
 
-    USEARCH_ASSERT(index && buffer && length && error && "Missing arguments");
+    USEARCH_ASSERT(index && error && "Missing arguments");
+    if (!buffer || !length) {
+        *error = "Buffer is empty";
+        return;
+    }
     memory_mapped_file_t memory_map((byte_t*)buffer, length);
     serialization_result_t result = reinterpret_cast<index_dense_t*>(index)->load(std::move(memory_map));
     if (!result)
@@ -272,7 +276,11 @@ USEARCH_EXPORT void usearch_load_buffer(usearch_index_t index, void const* buffe
 USEARCH_EXPORT void usearch_view_buffer(usearch_index_t index, void const* buffer, size_t length,
                                         usearch_error_t* error) {
 
-    USEARCH_ASSERT(index && buffer && length && error && "Missing arguments");
+    USEARCH_ASSERT(index && error && "Missing arguments");
+    if (!buffer || !length) {
+        *error = "Buffer is empty";
+        return;
+    }
     memory_mapped_file_t memory_map((byte_t*)buffer, length);
     serialization_result_t result = reinterpret_cast<index_dense_t*>(index)->view(std::move(memory_map));
     if (!result)
@@ -282,7 +290,11 @@ USEARCH_EXPORT void usearch_view_buffer(usearch_index_t index, void const* buffe
 USEARCH_EXPORT void usearch_metadata_buffer(void const* buffer, size_t length, usearch_init_options_t* options,
                                             usearch_error_t* error) {
 
-    USEARCH_ASSERT(buffer && length && options && error && "Missing arguments");
+    USEARCH_ASSERT(options && error && "Missing arguments");
+    if (!buffer || !length) {
+        *error = "Buffer is empty";
+        return;
+    }
     index_dense_metadata_result_t result =
         index_dense_metadata_from_buffer(memory_mapped_file_t((byte_t*)(buffer), length));
     if (!result)
