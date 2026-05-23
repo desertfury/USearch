@@ -1245,10 +1245,14 @@ class index_dense_gt {
 
             config_.multi = head.multi;
             metric_ = metric_t::builtin(head.dimensions, head.kind_metric, head.kind_scalar);
-            // available_threads_.size() will be updated to old_limits.threads() later in this
-            // method, so use that as the number of threads to prepare for.
-            cast_buffer_ = cast_buffer_t(old_limits.threads() * metric_.bytes_per_vector());
-            if (!cast_buffer_)
+            // Refuse if `threads * bytes_per_vector()` would wrap `size_t`;
+            // also propagate a clean error when the allocator returns null.
+            std::size_t const per_vector = metric_.bytes_per_vector();
+            std::size_t const threads = old_limits.threads();
+            if (per_vector != 0 && threads > (std::numeric_limits<std::size_t>::max)() / per_vector)
+                return result.failed("Cast buffer size overflows");
+            cast_buffer_ = cast_buffer_t(threads * per_vector);
+            if (threads * per_vector != 0 && !cast_buffer_)
                 return result.failed("Failed to allocate memory for the casts");
             casts_ = casts_punned_t::make(head.kind_scalar);
         }
