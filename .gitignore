@@ -101,3 +101,6 @@ csharp/packages
 *.out
 *.app
 
+# Test artifacts
+tmp_pi_test.*
+
