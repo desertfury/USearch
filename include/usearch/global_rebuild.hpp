@@ -112,9 +112,18 @@ class global_rebuild_gt {
     bool active() const noexcept { return phase_ == phase_migrating_k || phase_ == phase_saving_k; }
     bool finished() const noexcept { return phase_ == phase_done_k; }
     std::size_t deferred_remove_count() const noexcept { return deferred_removes_.size(); }
-    /// @brief  Populated during the rebuild, released (null) at `phase_done_k`.
-    ///         Vectors alias the primary's storage - do not outlive it.
+    /// @brief  Populated during the rebuild and kept alive past `phase_done_k`
+    ///         until the caller releases it. Vectors alias the primary's
+    ///         storage (zero-copy migration) - do not outlive it without
+    ///         transferring ownership of those arenas first (e.g. via
+    ///         `index_dense_gt::absorb_vector_storage`).
     index_t const* shadow() const noexcept { return shadow_.get(); }
+    index_t* shadow_mutable() noexcept { return shadow_.get(); }
+
+    /// @brief  Hand the freshly built shadow over to the caller. Useful for an
+    ///         in-RAM swap: caller absorbs the primary's vector arenas into
+    ///         this shadow, then move-assigns it onto the primary.
+    std::unique_ptr<index_t> release_shadow() noexcept { return std::move(shadow_); }
 
     /// @brief  Always routed to the primary, never blocked.
     template <typename scalar_other_at>
@@ -184,7 +193,7 @@ class global_rebuild_gt {
                     continue; // key already gone (a deferred-remove race-with-self)
                 // Zero-copy: shadow aliases primary's vector bytes.
                 add_result_t added = shadow_->add(key, reinterpret_cast<scalar_t const*>(vector),
-                                                  index_t::any_thread(), /*copy_vector=*/false);
+                                                  /*copy_vector=*/false);
                 if (!added)
                     return result.failed(std::move(added.error));
                 ++migrated;
@@ -215,8 +224,10 @@ class global_rebuild_gt {
                 }
                 for (std::size_t i = 0; i != deferred_removes_.size(); ++i)
                     primary_->remove(deferred_removes_[i]);
-                // Shadow nodes alias the primary's vectors - don't outlive it.
-                shadow_.reset();
+                // Keep `shadow_` alive past `phase_done_k`: the caller (e.g.
+                // `persistent_index_gt`) may want to absorb the primary's
+                // vector arenas into it and swap it into place. If the
+                // caller never claims it, our dtor drops it.
                 phase_ = phase_done_k;
             }
             return result;

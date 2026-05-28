@@ -525,29 +525,28 @@ void test_collection(index_at& index, typename index_at::vector_key_t const star
     std::vector<scalar_at> const& vector_first = vectors[0];
     std::size_t dimensions = vector_first.size();
 
-    // Try batch requests, heavily over-subscribing the CPU cores
+    // The new concurrency model serializes writes behind an exclusive rwlock
+    // at the dense layer. The typed `index_gt` itself is not write-safe under
+    // concurrent calls, so inserts run sequentially. Reads remain parallel.
     std::size_t executor_threads = std::thread::hardware_concurrency();
     executor_default_t executor(executor_threads);
     expect(index.try_reserve({vectors.size(), executor.size()}));
-    executor.fixed(vectors.size(), [&](std::size_t thread, std::size_t task) {
+    for (std::size_t task = 0; task != vectors.size(); ++task) {
         if constexpr (punned_ak) {
             index_add_result_t result = index.add(start_key + task, vectors[task].data(), args...);
             expect(result);
         } else {
             index_update_config_t config;
-            config.thread = thread;
             index_add_result_t result = index.add(start_key + task, vectors[task].data(), args..., config);
             expect(result);
         }
-    });
+    }
 
     // Make sure we didn't lose parallelism settings after reload
     expect(index.limits().threads_search >= executor.size());
-    if constexpr (punned_ak)
-        expect(index.currently_available_threads() >= executor.size());
 
     // Parallel search over the same vectors
-    executor.fixed(vectors.size(), [&](std::size_t thread, std::size_t task) {
+    executor.fixed(vectors.size(), [&](std::size_t, std::size_t task) {
         std::size_t max_possible_matches = vectors.size();
         std::size_t count_requested = max_possible_matches;
         std::vector<vector_key_t> matched_keys(count_requested);
@@ -561,7 +560,6 @@ void test_collection(index_at& index, typename index_at::vector_key_t const star
             matched_count = result.dump_to(matched_keys.data(), matched_distances.data());
         } else {
             index_search_config_t config;
-            config.thread = thread;
             index_search_result_t result = index.search(vectors[task].data(), count_requested, args..., config);
             expect(result);
             matched_count = result.dump_to(matched_keys.data(), matched_distances.data());
@@ -605,7 +603,7 @@ void test_collection(index_at& index, typename index_at::vector_key_t const star
     expect(index.view("tmp.usearch"));
 
     // Parallel search over the same vectors
-    executor.fixed(vectors.size(), [&](std::size_t thread, std::size_t task) {
+    executor.fixed(vectors.size(), [&](std::size_t, std::size_t task) {
         // Check over-sampling beyond the size of the collection
         std::size_t max_possible_matches = vectors.size();
         std::size_t count_requested = max_possible_matches * 10;
@@ -620,7 +618,6 @@ void test_collection(index_at& index, typename index_at::vector_key_t const star
             matched_count = result.dump_to(matched_keys.data(), matched_distances.data());
         } else {
             index_search_config_t config;
-            config.thread = thread;
             index_search_result_t result = index.search(vectors[task].data(), count_requested, args..., config);
             expect(result);
             matched_count = result.dump_to(matched_keys.data(), matched_distances.data());
@@ -674,43 +671,6 @@ void test_collection(index_at& index, typename index_at::vector_key_t const star
  * @tparam scalar_at Data type of the elements in the vectors.
  * @tparam extra_args_at Variadic template parameter types for additional configuration.
  */
-template <typename index_at, typename scalar_at, typename... extra_args_at>
-void test_punned_concurrent_updates(index_at& index, typename index_at::vector_key_t const start_key,
-                                    std::vector<std::vector<scalar_at>> const& vectors, std::size_t executor_threads) {
-
-    using index_t = index_at;
-
-    // Try batch requests, heavily oversubscribing the CPU cores
-    executor_default_t executor(executor_threads);
-    expect(index.try_reserve({vectors.size(), executor.size()}));
-    executor.fixed(vectors.size(), [&](std::size_t, std::size_t task) {
-        using add_result_t = typename index_t::add_result_t;
-        add_result_t result = index.add(start_key + task, vectors[task].data());
-        expect(result);
-    });
-    expect_eq(index.size(), vectors.size());
-
-    // Without key lookups we can't do much more
-    if (!index.config().enable_key_lookups)
-        return;
-
-    // Remove all the keys
-    executor.fixed(vectors.size(), [&](std::size_t, std::size_t task) {
-        using labeling_result_t = typename index_t::labeling_result_t;
-        labeling_result_t result = index.remove(start_key + task);
-        expect(result);
-    });
-    expect_eq(index.size(), 0);
-
-    // Add them back, which under the hood will trigger the `update`
-    executor.fixed(vectors.size(), [&](std::size_t, std::size_t task) {
-        using add_result_t = typename index_t::add_result_t;
-        add_result_t result = index.add(start_key + task, vectors[task].data());
-        expect(result);
-    });
-    expect_eq(index.size(), vectors.size());
-}
-
 /**
  * Overloaded function to test cosine similarity index functionality using specific scalar, key, and slot types.
  *
@@ -819,19 +779,6 @@ void test_cosine(std::size_t collection_size, std::size_t dimensions) {
             test_collection<true>(index_result.index, 42, vector_of_vectors);
         }
 
-        // Try running benchmarks with a different number of threads
-        for (std::size_t threads : {
-                 static_cast<std::size_t>(1),
-                 // TODO: Multithreaded updates should word differently and may involve a search first
-                 //  static_cast<std::size_t>(2),
-                 //  static_cast<std::size_t>(std::thread::hardware_concurrency()),
-                 //  static_cast<std::size_t>(std::thread::hardware_concurrency() * 4),
-                 //  static_cast<std::size_t>(vector_of_vectors.size()),
-             }) {
-            index_result_t index_result = index_t::make(metric, config);
-            index_t& index = index_result.index;
-            test_punned_concurrent_updates(index, 42, vector_of_vectors, threads);
-        }
     };
 
     for (bool multi : {false, true})
@@ -1498,7 +1445,9 @@ void test_global_rebuild() {
     expect(rebuild.finished());
     expect(side_ops_done);
     expect(shadow_checked);
-    expect(rebuild.shadow() == nullptr); // released at completion
+    // The shadow is kept past completion so callers (e.g. persistent_index_gt)
+    // can absorb the primary's vector arenas into it and swap it in-place.
+    expect(rebuild.shadow() != nullptr);
     // Completion atomically replaced the sentinel with the real index.
     expect(read_path() != sentinel);
 

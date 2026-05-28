@@ -658,140 +658,6 @@ template <typename allocator_at = std::allocator<byte_t>> class bitset_gt {
 using bitset_t = bitset_gt<>;
 
 /**
- *  @brief  Cache-line-padded striped spin-lock array for concurrent graph mutations.
- *          Maps node slots to lock stripes via Fibonacci hashing, with each stripe
- *          occupying its own cache line to eliminate false sharing.
- *          The number of stripes is proportional to `threads * connectivity`, not
- *          graph size, keeping the lock array comfortably within L2/L3 cache.
- */
-template <typename allocator_at = std::allocator<byte_t>, std::size_t cache_line_ak = 128> //
-class striped_locks_gt {
-    using allocator_t = allocator_at;
-    using byte_t = typename allocator_t::value_type;
-    static_assert(sizeof(byte_t) == 1, "Allocator must allocate separate addressable bytes");
-
-    static constexpr std::uint64_t fibonacci_k = 0x9E3779B97F4A7C15ull;
-
-    using atomic_flag_t = std::atomic<std::uint8_t>;
-    struct alignas(cache_line_ak) padded_lock_t {
-        atomic_flag_t flag{0};
-        char padding_[cache_line_ak - sizeof(atomic_flag_t)];
-    };
-    static_assert(sizeof(padded_lock_t) == cache_line_ak, "Lock stripe must be exactly one cache line");
-
-    // `padded_lock_t` is `alignas(cache_line_ak)` (128 B by default) which
-    // exceeds what a plain allocator guarantees (typically 16 B on x86-64).
-    // Rather than demanding an over-aligned allocator, we over-allocate and
-    // keep a pointer to the aligned sub-region — `raw_` is what we hand back
-    // to the allocator, `stripes_` is the aligned view used for reads/writes.
-    byte_t* raw_{};
-    std::size_t raw_bytes_{};
-    padded_lock_t* stripes_{};
-    std::size_t count_{};
-    unsigned shift_{};
-
-    inline std::size_t stripe_for_(std::size_t slot) const noexcept {
-        return static_cast<std::size_t>((static_cast<std::uint64_t>(slot) * fibonacci_k) >> shift_);
-    }
-
-  public:
-    striped_locks_gt() noexcept {}
-    ~striped_locks_gt() noexcept { reset(); }
-
-    explicit operator bool() const noexcept { return stripes_; }
-
-    void reset() noexcept {
-        if (stripes_)
-            for (std::size_t i = 0; i < count_; i++)
-                stripes_[i].~padded_lock_t();
-        if (raw_)
-            allocator_t{}.deallocate(raw_, raw_bytes_);
-        raw_ = nullptr;
-        raw_bytes_ = 0;
-        stripes_ = nullptr;
-        count_ = 0;
-        shift_ = 64;
-    }
-
-    striped_locks_gt(std::size_t threads, std::size_t connectivity) noexcept {
-        checked_size_result_t desired = checked_mul(threads, connectivity);
-        desired = desired ? checked_mul(desired.value, std::size_t{4}) : desired;
-        if (!desired) {
-            shift_ = 64;
-            return;
-        }
-
-        checked_size_result_t count = checked_ceil2((std::max<std::size_t>)(desired.value, 256));
-        if (!count) {
-            shift_ = 64;
-            return;
-        }
-        count_ = count.value;
-        shift_ = 64;
-        for (std::size_t n = count_; n > 1; n >>= 1)
-            shift_--;
-        // Request one extra stripe's worth of slack so we can always land on a
-        // `cache_line_ak`-aligned address inside the allocation, regardless of
-        // what the underlying allocator returns.
-        constexpr std::size_t alignment_k = alignof(padded_lock_t);
-        checked_size_result_t raw_bytes = checked_mul_add(count_, sizeof(padded_lock_t), alignment_k);
-        if (!raw_bytes) {
-            count_ = 0;
-            shift_ = 64;
-            return;
-        }
-        raw_bytes_ = raw_bytes.value;
-        raw_ = allocator_t{}.allocate(raw_bytes_);
-        if (!raw_) {
-            raw_bytes_ = 0;
-            count_ = 0;
-            shift_ = 64;
-            return;
-        }
-        auto raw_address = reinterpret_cast<std::uintptr_t>(raw_);
-        auto aligned_address = (raw_address + alignment_k - 1) & ~(static_cast<std::uintptr_t>(alignment_k) - 1);
-        stripes_ = reinterpret_cast<padded_lock_t*>(aligned_address);
-        for (std::size_t i = 0; i < count_; i++)
-            new (&stripes_[i]) padded_lock_t();
-    }
-
-    striped_locks_gt(striped_locks_gt&& other) noexcept {
-        raw_ = exchange(other.raw_, (byte_t*)nullptr);
-        raw_bytes_ = exchange(other.raw_bytes_, std::size_t{0});
-        stripes_ = exchange(other.stripes_, nullptr);
-        count_ = exchange(other.count_, std::size_t{0});
-        shift_ = exchange(other.shift_, unsigned{64});
-    }
-
-    striped_locks_gt& operator=(striped_locks_gt&& other) noexcept {
-        std::swap(raw_, other.raw_);
-        std::swap(raw_bytes_, other.raw_bytes_);
-        std::swap(stripes_, other.stripes_);
-        std::swap(count_, other.count_);
-        std::swap(shift_, other.shift_);
-        return *this;
-    }
-
-    striped_locks_gt(striped_locks_gt const&) = delete;
-    striped_locks_gt& operator=(striped_locks_gt const&) = delete;
-
-    inline bool atomic_set(std::size_t i) noexcept {
-        return stripes_[stripe_for_(i)].flag.exchange(1, std::memory_order_acquire);
-    }
-
-    inline void atomic_reset(std::size_t i) noexcept {
-        stripes_[stripe_for_(i)].flag.store(0, std::memory_order_release);
-    }
-
-    inline void lock(std::size_t i) noexcept {
-        while (atomic_set(i))
-            std::this_thread::yield();
-    }
-
-    inline void unlock(std::size_t i) noexcept { atomic_reset(i); }
-};
-
-/**
  *  @brief  Similar to `std::priority_queue`, but allows raw access to underlying
  *          memory, in case you want to shuffle it or sort. Good for collections
  *          from 100s to 10'000s elements.
@@ -1675,9 +1541,6 @@ struct index_update_config_t {
     /// Defaults to 40 in FAISS and 200 in hnswlib.
     /// > It is called `efConstruction` in the paper.
     std::size_t expansion = default_expansion_add();
-
-    /// @brief Optional thread identifier for multi-threaded construction.
-    std::size_t thread = 0;
 };
 
 struct index_search_config_t {
@@ -1685,9 +1548,6 @@ struct index_search_config_t {
     /// Defaults to 16 in FAISS and 10 in hnswlib.
     /// > It is called `ef` in the paper.
     std::size_t expansion = default_expansion_search();
-
-    /// @brief Optional thread identifier for multi-threaded construction.
-    std::size_t thread = 0;
 
     /// @brief Brute-forces exhaustive search over all entries in the index.
     bool exact = false;
@@ -1698,9 +1558,6 @@ struct index_cluster_config_t {
     /// Defaults to 16 in FAISS and 10 in hnswlib.
     /// > It is called `ef` in the paper.
     std::size_t expansion = default_expansion_search();
-
-    /// @brief Optional thread identifier for multi-threaded construction.
-    std::size_t thread = 0;
 };
 
 struct index_copy_config_t {};
@@ -2372,8 +2229,6 @@ class index_gt {
      */
     static constexpr std::size_t node_head_bytes_() { return sizeof(vector_key_t) + sizeof(level_t); }
 
-    using nodes_mutexes_t = striped_locks_gt<dynamic_allocator_t>;
-
     using visits_hash_set_t = growing_hash_set_gt<compressed_slot_t, hash_gt<compressed_slot_t>, dynamic_allocator_t>;
 
     struct precomputed_constants_t {
@@ -2538,10 +2393,12 @@ class index_gt {
     };
 
     /// @brief  Number of "slots" available for `node_t` objects. Equals to @b `limits_.members`.
-    mutable std::atomic<std::size_t> nodes_capacity_{};
+    ///         Plain (non-atomic) - all writes happen under the dense-layer exclusive rwlock.
+    std::size_t nodes_capacity_{};
 
     /// @brief  Number of "slots" already storing non-null nodes.
-    mutable std::atomic<std::size_t> nodes_count_{};
+    ///         Plain (non-atomic) - all writes happen under the dense-layer exclusive rwlock.
+    std::size_t nodes_count_{};
 
     index_config_t config_{};
     index_limits_t limits_{};
@@ -2551,10 +2408,6 @@ class index_gt {
 
     precomputed_constants_t pre_{};
     memory_mapped_file_t viewed_file_{};
-
-    /// @brief  Controls access to `max_level_` and `entry_slot_`.
-    ///         If any thread is updating those values, no other threads can `add()` or `search()`.
-    std::mutex global_mutex_{};
 
     /// @brief  The level of the top-most graph in the index. Grows as the logarithm of size, starts from zero.
     level_t max_level_{};
@@ -2567,21 +2420,12 @@ class index_gt {
     /// @brief  C-style array of `node_t` smart-pointers. Use `compressed_slot_t` for indexing.
     buffer_gt<node_t, nodes_allocator_t> nodes_{};
 
-    /// @brief  Mutex, that limits concurrent access to `nodes_`.
-    mutable nodes_mutexes_t nodes_mutexes_{};
-
-    using contexts_allocator_t = typename dynamic_allocator_traits_t::template rebind_alloc<context_t>;
-
-    /// @brief  Array of thread-specific buffers for temporary data.
-    mutable buffer_gt<context_t, contexts_allocator_t> contexts_{};
-
-    context_t* context_or_null_(std::size_t thread) noexcept {
-        return thread < contexts_.size() ? contexts_.data() + thread : nullptr;
-    }
-
-    context_t const* context_or_null_(std::size_t thread) const noexcept {
-        return thread < contexts_.size() ? contexts_.data() + thread : nullptr;
-    }
+    /// @brief  Single dedicated work-context for the @b writer.
+    ///         All writers are serialized by the dense-layer rwlock, so the
+    ///         same buffers (visited bitset, candidate queues, RNG, counters)
+    ///         can be reused across calls. Readers allocate their own
+    ///         transient context per call.
+    mutable context_t write_ctx_{};
 
   public:
     std::size_t connectivity() const noexcept { return config_.connectivity; }
@@ -2603,7 +2447,7 @@ class index_gt {
         dynamic_allocator_t dynamic_allocator = {}, tape_allocator_t tape_allocator = {}) noexcept(false)
         : nodes_capacity_(0u), nodes_count_(0u), config_(), limits_(0, 0),
           dynamic_allocator_(std::move(dynamic_allocator)), tape_allocator_(std::move(tape_allocator)),
-          pre_(precompute_({})), max_level_(-1), entry_slot_(0u), nodes_(), nodes_mutexes_(), contexts_() {}
+          pre_(precompute_({})), max_level_(-1), entry_slot_(0u), nodes_(), write_ctx_() {}
 
     /**
      *  @brief Default index constructor, suitable only for stateless allocators.
@@ -2695,7 +2539,7 @@ class index_gt {
         for (std::size_t i = 0; i != nodes_count_; ++i)
             other.nodes_[i] = other.node_make_copy_(node_bytes_(nodes_[i]));
 
-        other.nodes_count_ = nodes_count_.load();
+        other.nodes_count_ = nodes_count_;
         other.max_level_ = max_level_;
         other.entry_slot_ = entry_slot_;
 
@@ -2860,8 +2704,7 @@ class index_gt {
         clear();
 
         nodes_ = {};
-        contexts_ = {};
-        nodes_mutexes_ = {};
+        write_ctx_ = {};
         limits_ = index_limits_t{0, 0};
         nodes_capacity_ = 0;
         viewed_file_ = memory_mapped_file_t{};
@@ -2869,7 +2712,7 @@ class index_gt {
     }
 
     /**
-     *  @brief  Swaps the underlying memory buffers and thread contexts.
+     *  @brief  Swaps the underlying memory buffers and the write context.
      */
     void swap(index_gt& other) noexcept {
         std::swap(config_, other.config_);
@@ -2881,16 +2724,9 @@ class index_gt {
         std::swap(max_level_, other.max_level_);
         std::swap(entry_slot_, other.entry_slot_);
         std::swap(nodes_, other.nodes_);
-        std::swap(nodes_mutexes_, other.nodes_mutexes_);
-        std::swap(contexts_, other.contexts_);
-
-        // Non-atomic parts.
-        std::size_t capacity_copy = nodes_capacity_;
-        std::size_t count_copy = nodes_count_;
-        nodes_capacity_ = other.nodes_capacity_.load();
-        nodes_count_ = other.nodes_count_.load();
-        other.nodes_capacity_ = capacity_copy;
-        other.nodes_count_ = count_copy;
+        std::swap(write_ctx_, other.write_ctx_);
+        std::swap(nodes_capacity_, other.nodes_capacity_);
+        std::swap(nodes_count_, other.nodes_count_);
     }
 
     /**
@@ -2912,24 +2748,19 @@ class index_gt {
         }
 
         std::size_t connectivity_max = (std::max)(config_.connectivity_base, config_.connectivity);
-        nodes_mutexes_t new_mutexes(limits.threads(), connectivity_max);
         buffer_gt<node_t, nodes_allocator_t> new_nodes(limits.members);
-        buffer_gt<context_t, contexts_allocator_t> new_contexts(limits.threads());
-        if (!new_nodes || !new_contexts || !new_mutexes)
+        if (!new_nodes)
             return false;
 
         // Move the nodes info, and deallocate previous buffers.
         if (nodes_)
             std::memcpy(new_nodes.data(), nodes_.data(), sizeof(node_t) * size());
-        for (std::size_t i = 0; i != new_contexts.size(); ++i)
-            if (!new_contexts[i].top_for_refine.reserve(connectivity_max + 1))
-                return false;
+        if (!write_ctx_.top_for_refine.reserve(connectivity_max + 1))
+            return false;
 
         limits_ = limits;
         nodes_capacity_ = limits.members;
         nodes_ = std::move(new_nodes);
-        contexts_ = std::move(new_contexts);
-        nodes_mutexes_ = std::move(new_mutexes);
         return true;
     }
 
@@ -3195,11 +3026,8 @@ class index_gt {
         if (is_immutable())
             return result.failed("Can't add to an immutable index");
 
-        // Make sure we have enough local memory to perform this request
-        context_t* context_ptr = context_or_null_(config.thread);
-        if (!context_ptr)
-            return result.failed("Reserve capacity ahead of insertions!");
-        context_t& context = *context_ptr;
+        // Single shared write context (writes are serialized at the dense-layer rwlock).
+        context_t& context = write_ctx_;
         top_candidates_t& top = context.top_candidates;
         next_candidates_t& next = context.next_candidates;
         top.clear();
@@ -3214,28 +3042,21 @@ class index_gt {
         if (!next.reserve(config.expansion))
             return result.failed("Out of memory!");
 
-        // Determining how much memory to allocate for the node depends on the target level
-        std::unique_lock<std::mutex> new_level_lock(global_mutex_);
-        level_t max_level_copy = max_level_;                                             // Copy under lock
-        compressed_slot_t entry_slot_copy = static_cast<compressed_slot_t>(entry_slot_); // Copy under lock
+        level_t max_level_copy = max_level_;
+        compressed_slot_t entry_slot_copy = static_cast<compressed_slot_t>(entry_slot_);
         level_t new_target_level = choose_random_level_(context.level_generator);
 
         // Make sure we are not overflowing
-        std::size_t capacity = nodes_capacity_.load();
-        std::size_t old_size = nodes_count_.fetch_add(1);
-        if (old_size >= capacity) {
-            nodes_count_.fetch_sub(1);
+        if (nodes_count_ >= nodes_capacity_)
             return result.failed("Reserve capacity ahead of insertions!");
-        }
+        std::size_t old_size = nodes_count_++;
 
         // Allocate the neighbors
         node_t new_node = node_make_(key, new_target_level);
         if (!new_node) {
-            nodes_count_.fetch_sub(1);
+            --nodes_count_;
             return result.failed("Out of memory!");
         }
-        if (new_target_level <= max_level_copy)
-            new_level_lock.unlock();
 
         nodes_[old_size] = new_node;
         result.new_size = old_size + 1;
@@ -3266,7 +3087,6 @@ class index_gt {
             search_to_insert_(value, metric, prefetch, closest_slot, level, config.expansion, context);
             candidates_view_t closest_view;
             {
-                node_lock_t new_lock = node_lock_(new_slot);
                 neighbors_(new_node, level).clear();
                 closest_view = form_links_to_closest_(metric, new_slot, level, context);
                 closest_slot = closest_view[0].slot;
@@ -3336,11 +3156,8 @@ class index_gt {
         add_result_t result;
         compressed_slot_t updated_slot = iterator.slot_;
 
-        // Make sure we have enough local memory to perform this request
-        context_t* context_ptr = context_or_null_(config.thread);
-        if (!context_ptr)
-            return result.failed("Reserve capacity ahead of updates!");
-        context_t& context = *context_ptr;
+        // Single shared write context (writes are serialized at the dense-layer rwlock).
+        context_t& context = write_ctx_;
         top_candidates_t& top = context.top_candidates;
         next_candidates_t& next = context.next_candidates;
         top.clear();
@@ -3358,14 +3175,8 @@ class index_gt {
         node_t updated_node = node_at_(updated_slot);
         level_t updated_node_level = updated_node.level();
 
-        // Copy entry coordinates under locks
-        level_t max_level_copy;
-        compressed_slot_t entry_slot_copy;
-        {
-            std::unique_lock<std::mutex> new_level_lock(global_mutex_);
-            max_level_copy = max_level_;                                   // Copy under lock
-            entry_slot_copy = static_cast<compressed_slot_t>(entry_slot_); // Copy under lock
-        }
+        level_t max_level_copy = max_level_;
+        compressed_slot_t entry_slot_copy = static_cast<compressed_slot_t>(entry_slot_);
 
         // Pull stats
         result.computed_distances = context.computed_distances;
@@ -3390,7 +3201,6 @@ class index_gt {
 
             candidates_view_t closest_view;
             {
-                node_lock_t updated_lock = node_lock_(updated_slot);
                 // TODO: Go through existing neighbors removing reverse links
                 // for (compressed_slot_t slot : neighbors_(updated_node, level))
                 //     remove_link_(slot, updated_slot, level);
@@ -3444,16 +3254,15 @@ class index_gt {
         if (!config.expansion)
             config.expansion = default_expansion_search();
 
-        // Using references is cleaner, but would result in UBSan false positives
-        context_t* context_ptr = contexts_.data() ? contexts_.data() + config.thread : nullptr;
-        top_candidates_t* top_ptr = context_ptr ? &context_ptr->top_candidates : nullptr;
-        search_result_t result{*this, top_ptr};
-        if (!nodes_count_.load(std::memory_order_relaxed))
+        // Concurrent readers run under a shared lock at the dense layer, so each
+        // thread needs its own scratch storage - `thread_local` gives us that
+        // without any explicit thread indexing.
+        static thread_local context_t search_ctx{};
+        context_t& context = search_ctx;
+        top_candidates_t& top = context.top_candidates;
+        search_result_t result{*this, &top};
+        if (!nodes_count_)
             return result;
-
-        usearch_assert_m(contexts_.size() > config.thread, "Thread index out of bounds");
-        context_t& context = *context_ptr;
-        top_candidates_t& top = *top_ptr;
         // Go down the level, tracking only the closest match
         result.computed_distances = context.computed_distances;
         result.visited_members = context.iteration_cycles;
@@ -3515,7 +3324,8 @@ class index_gt {
         if (!config.expansion)
             config.expansion = default_expansion_search();
 
-        context_t& context = contexts_[config.thread];
+        static thread_local context_t cluster_ctx{};
+        context_t& context = cluster_ctx;
         cluster_result_t result;
         if (!nodes_count_)
             return result.failed("No clusters to identify");
@@ -4135,9 +3945,10 @@ class index_gt {
         if (!total)
             return;
 
-        // For every bottom level node, determine its parent cluster
-        executor.dynamic(slots_and_levels.size(), [&](std::size_t thread_idx, std::size_t old_slot_as_uint) {
-            context_t& context = contexts_[thread_idx];
+        // For every bottom level node, determine its parent cluster.
+        // Compaction is single-threaded under the dense-layer exclusive lock - we reuse the writer's context.
+        context_t& context = write_ctx_;
+        for (std::size_t old_slot_as_uint = 0; old_slot_as_uint != slots_and_levels.size(); ++old_slot_as_uint) {
             compressed_slot_t old_slot = static_cast<compressed_slot_t>(old_slot_as_uint);
             compressed_slot_t cluster = search_for_one_( //
                 values[citerator_at(old_slot)],          //
@@ -4145,10 +3956,11 @@ class index_gt {
                 static_cast<compressed_slot_t>(entry_slot_), max_level_, 0, context);
             slots_and_levels[old_slot] = {old_slot, cluster, node_at_(old_slot).level()};
             ++processed;
-            if (thread_idx == 0)
-                do_tasks = progress(processed.load(), total.value);
-            return do_tasks.load();
-        });
+            do_tasks = progress(processed.load(), total.value);
+            if (!do_tasks.load())
+                break;
+        }
+        (void)executor;
         if (!do_tasks.load())
             return;
 
@@ -4225,7 +4037,7 @@ class index_gt {
 
         // Erase all the incoming links
         std::size_t nodes_count = size();
-        executor.dynamic(nodes_count, [&](std::size_t thread_idx, std::size_t node_idx) {
+        for (std::size_t node_idx = 0; node_idx != nodes_count; ++node_idx) {
             node_t node = node_at_(node_idx);
             for (level_t level = 0; level <= node.level(); ++level) {
                 neighbors_ref_t neighbors = neighbors_(node, level);
@@ -4235,10 +4047,11 @@ class index_gt {
                 });
             }
             ++processed;
-            if (thread_idx == 0)
-                do_tasks = progress(processed.load(), nodes_count);
-            return do_tasks.load();
-        });
+            do_tasks = progress(processed.load(), nodes_count);
+            if (!do_tasks.load())
+                break;
+        }
+        (void)executor;
 
         // At the end report the latest numbers, because the reporter thread may be finished earlier
         progress(processed.load(), nodes_count);
@@ -4311,54 +4124,6 @@ class index_gt {
         return level ? neighbors_non_base_(node, level) : neighbors_base_(node);
     }
 
-    struct node_lock_t {
-        nodes_mutexes_t& mutexes;
-        std::size_t slot;
-        inline ~node_lock_t() noexcept { mutexes.unlock(slot); }
-    };
-
-    inline node_lock_t node_lock_(std::size_t slot) const noexcept {
-        nodes_mutexes_.lock(slot);
-        return {nodes_mutexes_, slot};
-    }
-
-    struct optional_node_lock_t {
-        nodes_mutexes_t& mutexes;
-        std::size_t slot;
-        inline ~optional_node_lock_t() noexcept {
-            if (slot != (std::numeric_limits<std::size_t>::max)())
-                mutexes.unlock(slot);
-        }
-    };
-
-    inline optional_node_lock_t optional_node_lock_(std::size_t slot, bool condition) const noexcept {
-        if (condition) {
-            nodes_mutexes_.lock(slot);
-            return {nodes_mutexes_, slot};
-        } else {
-            return {nodes_mutexes_, (std::numeric_limits<std::size_t>::max)()};
-        }
-    }
-
-    struct node_conditional_lock_t {
-        nodes_mutexes_t& mutexes;
-        std::size_t slot;
-        inline ~node_conditional_lock_t() noexcept {
-            if (slot != (std::numeric_limits<std::size_t>::max)())
-                mutexes.unlock(slot);
-        }
-    };
-
-    inline node_conditional_lock_t node_try_conditional_lock_(std::size_t slot, bool condition,
-                                                              bool& failed_to_acquire) const noexcept {
-        if (!condition) {
-            failed_to_acquire = false;
-            return {nodes_mutexes_, (std::numeric_limits<std::size_t>::max)()};
-        }
-        failed_to_acquire = nodes_mutexes_.atomic_set(slot);
-        return {nodes_mutexes_, failed_to_acquire ? (std::numeric_limits<std::size_t>::max)() : slot};
-    }
-
     template <typename metric_at, bool require_non_empty_ak = false>
     candidates_view_t form_links_to_closest_( //
         metric_at&& metric, std::size_t new_slot, level_t level, context_t& context) usearch_noexcept_m {
@@ -4395,7 +4160,6 @@ class index_gt {
             compressed_slot_t close_slot = new_neighbor.slot;
             if (close_slot == new_slot)
                 continue;
-            node_lock_t close_lock = node_lock_(close_slot);
             node_t close_node = node_at_(close_slot);
             neighbors_ref_t close_header = neighbors_(close_node, level);
 
@@ -4516,13 +4280,11 @@ class index_gt {
         if (!is_dummy<prefetch_at>())
             prefetch(citerator_at(closest_slot), citerator_at(closest_slot) + 1);
 
-        bool const need_lock = !is_immutable();
         distance_t closest_dist = context.measure(query, citerator_at(closest_slot), metric);
         for (level_t level = begin_level; level > end_level; --level) {
             bool changed;
             do {
                 changed = false;
-                optional_node_lock_t closest_lock = optional_node_lock_(closest_slot, need_lock);
                 neighbors_ref_t closest_neighbors = neighbors_non_base_(node_at_(closest_slot), level);
 
                 // Optional prefetching
@@ -4594,7 +4356,6 @@ class index_gt {
 
             compressed_slot_t candidate_slot = candidacy.slot;
             node_t candidate_ref = node_at_(candidate_slot);
-            node_lock_t candidate_lock = node_lock_(candidate_slot);
             neighbors_ref_t candidate_neighbors = neighbors_(candidate_ref, level);
 
             // Optional prefetching
@@ -4611,9 +4372,6 @@ class index_gt {
                 if (visits.set(successor_slot))
                     continue;
 
-                // We don't access the neighbors of the `successor_slot` node,
-                // so we don't have to lock it.
-                // node_lock_t successor_lock = node_lock_(successor_slot);
                 distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
                 if (top.size() < top_limit || successor_dist < radius) {
                     // This can substantially grow our priority queue:
@@ -4676,17 +4434,6 @@ class index_gt {
 
             compressed_slot_t candidate_slot = candidacy.slot;
             node_t candidate_ref = node_at_(candidate_slot);
-
-            // The trickiest part of update-heavy workloads is mitigating dead-locks
-            // in connected nodes during traversal. A "good enough" solution would be
-            // to skip concurrent access, assuming the other "close" node is gonna add
-            // this one when forming reverse connections.
-            bool failed_to_acquire = false;
-            node_conditional_lock_t candidate_lock =
-                node_try_conditional_lock_(candidate_slot, updated_slot != candidate_slot, failed_to_acquire);
-            if (failed_to_acquire)
-                continue;
-            auto optional_node_lock = optional_node_lock_(candidate_slot, updated_slot == candidate_slot);
             neighbors_ref_t candidate_neighbors = neighbors_(candidate_ref, level);
 
             // Optional prefetching
@@ -4703,10 +4450,6 @@ class index_gt {
                 if (visits.set(successor_slot))
                     continue;
 
-                // We don't access the neighbors of the `successor_slot` node,
-                // so we don't have to lock it.
-                // node_conditional_lock_t successor_lock =
-                //     node_try_conditional_lock_(successor_slot, updated_slot != successor_slot);
                 distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
                 if (top.size() < top_limit || successor_dist < radius) {
                     // This can substantially grow our priority queue:
@@ -5027,7 +4770,6 @@ static join_result_t join(               //
         index_search_config_t search_config;
         search_config.expansion = config.expansion;
         search_config.exact = config.exact;
-        search_config.thread = thread_idx;
         compressed_slot_t free_man_slot;
 
         // While there exist a free man who still has a woman to propose to.

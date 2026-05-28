@@ -1790,6 +1790,53 @@ template <std::size_t alignment_ak = 1> class memory_mapping_allocator_gt {
      *  @warning The very first memory de-allocation discards all the arenas!
      */
     void deallocate(byte_t* = nullptr, std::size_t = 0) noexcept { reset(); }
+
+    /**
+     *  @brief  Take ownership of @p other's arena chain by grafting it onto
+     *          the tail of this allocator's chain. Memory is not copied; any
+     *          pointers into @p other's arenas remain valid after the call -
+     *          they are now owned by `*this`. After returning, @p other is
+     *          left empty and resets to its default state.
+     *
+     *  New `allocate` calls on `*this` still grow from `last_arena_` (the
+     *  newest arena of this allocator), so the migrated arenas are never
+     *  written into; they only get freed when `*this` is destroyed or reset.
+     */
+    void absorb_chain(memory_mapping_allocator_gt& other) noexcept {
+        if (this == &other)
+            return;
+        std::unique_lock<std::mutex> lock_a(mutex_, std::defer_lock);
+        std::unique_lock<std::mutex> lock_b(other.mutex_, std::defer_lock);
+        std::lock(lock_a, lock_b);
+
+        if (!other.last_arena_)
+            return;
+        if (!last_arena_) {
+            last_arena_ = other.last_arena_;
+            last_usage_ = other.last_usage_;
+            last_capacity_ = other.last_capacity_;
+        } else {
+            // Walk to the oldest arena of `*this` (prev == nullptr) and link
+            // `other.last_arena_` in as its previous arena, so the chain
+            // [our newest..our oldest..their newest..their oldest] becomes ours.
+            byte_t* node = last_arena_;
+            while (true) {
+                byte_t* prev = nullptr;
+                std::memcpy(&prev, node, sizeof(byte_t*));
+                if (!prev)
+                    break;
+                node = prev;
+            }
+            std::memcpy(node, &other.last_arena_, sizeof(byte_t*));
+        }
+        wasted_space_ += other.wasted_space_;
+        total_allocated_ += other.total_allocated_;
+        other.last_arena_ = nullptr;
+        other.last_usage_ = head_size();
+        other.last_capacity_ = min_capacity();
+        other.wasted_space_ = 0;
+        other.total_allocated_ = 0;
+    }
 };
 
 using memory_mapping_allocator_t = memory_mapping_allocator_gt<>;
